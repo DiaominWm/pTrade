@@ -15,12 +15,21 @@
   4. ETF 无 T+1 限制，当日买入可当日卖出（正T 得以成立）。
 
 数据限制（务必先读）：
-  东财 fund_etf_hist_min_em / index_zh_a_hist_min_em 只返回最近约 5 个交易日，
-  无法覆盖 2024-01-01 起的完整区间。取不到真实 5 分钟数据时会用日线合成的
-  5 分钟 bar 跑通流程，此时结果**不可用于实盘决策**，仅验证代码正确性。
-  要得到真实结论，请用本地 5 分钟 CSV 或换付费数据源替换 fetch_5min。
+  东财 fund_etf_hist_min_em / index_zh_a_hist_min_em 只返回最近约 5 个交易日且极易被
+  push2 限流，**已不再作为主数据源**。fetch_5min 现在按
+      本地 cache/*.pkl|csv  >  baostock  >  新浪  >  东财
+  的顺序多源拼合（均免 token、不依赖东财），合并结果回写 cache/ 供下次复用。
+
+  各源覆盖情况（实测）：
+    baostock  159915 覆盖 2024-01~2024-09 与 2026-01/03~10，但不支持指数分钟线；
+              2025 全年及 2026-02 无数据（上游服务端即缺失，不是参数问题）。
+    新浪      只给最近约 1500 根（≈31 个交易日），无分页参数，ETF 与指数都可用。
+    → 两者拼合后仍有缺口。缺口不会被静默填补：程序会打印缺失的交易日区间，
+      并且**不再自动用合成数据顶替真实区间**（见 SYNTH_FALLBACK）。
+      要拿到连续历史，请每天运行一次本脚本，让新浪的近 31 日窗口逐日滚进 cache/。
 """
 import itertools
+import json
 import os
 
 import akshare as ak
@@ -31,7 +40,7 @@ import pandas as pd
 # 一、参数
 # ======================================================================
 
-SYMBOL = "159915"
+SYMBOL = "600584"  # 159915 创业板 ETF，600584 长江电力（测试用）
 START_DATE = "2024-01-01"
 END_DATE = "2026-10-30"
 
@@ -81,13 +90,32 @@ LOSE_STREAK_PAUSE = 3          # 连亏 3 次 → 暂停做T 5 日
 PAUSE_DAYS = 5
 
 # ---------- 市场择时（"大盘"代理） ----------
-MARKET_INDEX = "sh000300"      # 沪深300，用于暴跌判断与 5 分钟跌破 VWAP 过滤
-MARKET_VWAP_FILTER = True      # 沪深300 跌破当日 VWAP 时，禁止高抛（避免卖在下跌初段）
+MARKET_INDEX = "sh000300"      # 大盘代理，可改成任意指数或个股：sh000300 / sz000001 / sh600519
+MARKET_VWAP_FILTER = True      # 大盘跌破当日 VWAP 时，禁止高抛（避免卖在下跌初段）
+
+
+def _is_index(symbol):
+    """判断代码是指数还是个股票。
+
+    上证指数段：000xxx（上证指数/深证成指等，sh000300、sz399001…）
+    深证指数段：399xxx
+    个股：60xxxx(沪主板) / 68xxxx(科创板) / 00xxxx(深主板) / 30xxxx(创业板) / 8xxxxx(北交所)
+    """
+    code = symbol[2:] if symbol[:2] in ("sh", "sz") else symbol
+    return code.startswith("399") or (code.startswith("000") and symbol.startswith("sh"))
+
+
+MARKET_IS_INDEX = _is_index(MARKET_INDEX)
+MARKET_TAG = "指数" if MARKET_IS_INDEX else "个股"
 
 ENABLE_GRID = True
 GRID_RSI_SELL = [68, 72, 76]
 GRID_VWAP_ATR = [0.8, 1.0, 1.2]
 GRID_BUYBACK_DROP = [0.005, 0.007, 0.010]
+
+# 真实 5 分钟数据一根都取不到时，是否用日线合成 bar 顶替跑通流程。
+# 合成数据只验证代码路径，结果不可用于决策——默认关闭，避免误读收益曲线。
+SYNTH_FALLBACK = os.environ.get("PTRADE_SYNTH_FALLBACK", "0") == "1"
 
 REPORT_FILE = "backtest_etf_t_report.xlsx"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cache")
@@ -114,14 +142,19 @@ def _normalize(df, date_col):
 
 
 def fetch_daily(symbol=SYMBOL, start=START_DATE, end=END_DATE, index=False):
-    """日线：优先新浪源（限流宽松），失败再退回东财。均带本地缓存。"""
-    tag = f"{'idx' if index else 'etf'}_{symbol}_daily.pkl"
+    """日线：优先新浪源（限流宽松），失败再退回东财。均带本地缓存。
+
+    index=True 时按指数取（沪深300 等）；个股/ETF 自动按代码段判断，无需手动切换。
+    缓存文件名带 kind，避免"指数 000001"和"个股 000001"互相覆盖。
+    """
+    kind = "idx" if index else ("stock" if _is_index(symbol) else "etf")
+    tag = f"{kind}_{symbol}_daily.pkl"
     path = _cache_path(tag)
     if os.path.exists(path):
         df = pd.read_pickle(path)
     else:
         raw, date_col = None, None
-        sina_symbol = symbol if symbol[:2] in ("sh", "sz") else "sz" + symbol
+        sina_symbol = _sina_prefix(symbol)
         if index:
             try:
                 raw = ak.stock_zh_index_daily(symbol=sina_symbol)
@@ -129,14 +162,18 @@ def fetch_daily(symbol=SYMBOL, start=START_DATE, end=END_DATE, index=False):
             except Exception as e:
                 print(f"  新浪指数接口失败（{type(e).__name__}），改用东财")
         else:
+            # 新浪 fund_etf_hist_sina 对个股也能返回正确行情，ETF 与个股共用
             try:
                 raw = ak.fund_etf_hist_sina(symbol=sina_symbol)
                 date_col = "date"
             except Exception as e:
-                print(f"  新浪 ETF 接口失败（{type(e).__name__}），改用东财")
+                print(f"  新浪行情接口失败（{type(e).__name__}），改用东财")
         if raw is None:
             if index:
                 raw = ak.stock_zh_index_daily_em(symbol=symbol)
+            elif _is_index(symbol):
+                # 个股：按个股口径取，避免落到 ETF 接口
+                raw = ak.stock_zh_a_daily(symbol=sina_symbol, adjust="qfq")
             else:
                 raw = ak.fund_etf_hist_em(symbol=symbol, period="daily",
                                           start_date=start.replace("-", ""),
@@ -144,37 +181,221 @@ def fetch_daily(symbol=SYMBOL, start=START_DATE, end=END_DATE, index=False):
             date_col = "日期" if "日期" in raw.columns else "date"
         df = _normalize(raw, date_col)
         df.to_pickle(path)
-    mask = (df["datetime"] >= pd.Timestamp(start)) & (df["datetime"] <= pd.Timestamp(end))
-    return df[mask].reset_index(drop=True)
+    return _in_period(df, start, end).reset_index(drop=True)
+
+
+def _sina_prefix(symbol):
+    """补全交易所前缀。6 开头→sh，其余→sz；已有 sh/sz 前缀则原样返回。
+
+    不带前缀时不能一律补 sz：600584/688xxx 是上交所，补错前缀会取到别的标的。
+    """
+    if symbol[:2] in ("sh", "sz"):
+        return symbol
+    return ("sh" if symbol.startswith(("6", "9")) else "sz") + symbol
+
+
+def _bao_code(symbol):
+    """159915 -> sz.159915；sh000300 -> sh.000300。"""
+    s = _sina_prefix(symbol)
+    return f"{s[:2]}.{s[2:]}"
+
+
+def fetch_sina_5min(symbol, end, datalen=1500):
+    """新浪分钟线：免 token、不限流，单次最多 1500 根（约 31 个交易日），只能取到最新一段。
+
+    这里是增量采集的关键——每天跑一次就能把历史一段段攒进 cache。
+    """
+    import requests
+
+    code = _sina_prefix(symbol)
+    url = ("https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_x=/CN_MarketDataService.getKLineData"
+           f"?symbol={code}&scale=5&ma=no&datalen={datalen}")
+    r = requests.get(url, timeout=30,
+                     headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"})
+    r.raise_for_status()
+    text = r.text
+    payload = text[text.find("(") + 1: text.rfind(")")]
+    rows = json.loads(payload)
+    if not isinstance(rows, list) or not rows:
+        return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(rows)
+    df["datetime"] = pd.to_datetime(df["day"])
+    out = _normalize(df, "datetime")
+    return out[out["datetime"] < pd.Timestamp(end).normalize() + pd.Timedelta(days=1)] \
+        .reset_index(drop=True)
+
+
+def fetch_baostock_5min(symbol, start, end, index=False):
+    """baostock 分钟线：免 token、不限流，覆盖 2024-01~2024-09 与 2026 年。
+
+    个股与 ETF 都支持；**指数不支持**（query 会静默返回 0 行）。
+    判定依据是代码本身：个股/ETF 走这里，指数由新浪兜底。
+    """
+    import baostock as bs
+
+    if index or _is_index(symbol):
+        return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
+
+    logged_in = bs.login().error_code == "0"
+    try:
+        # 个股/ETF 用后复权（adjustflag=2），与日线 qfq 口径一致
+        rs = bs.query_history_k_data_plus(
+            _bao_code(symbol), "date,time,open,high,low,close,volume",
+            start_date=start, end_date=end, frequency="5", adjustflag="2")
+        rows = []
+        while rs.error_code == "0" and rs.next():
+            rows.append(rs.get_row_data())
+    finally:
+        if logged_in:
+            bs.logout()
+    if not rows:
+        return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
+
+    df = pd.DataFrame(rows, columns=["date", "time", "open", "high", "low", "close", "volume"])
+    df["datetime"] = pd.to_datetime(df["time"].str[:14], format="%Y%m%d%H%M%S")
+    # 09:30 那根是集合竞价残根，不是真实的 5 分钟 bar
+    df = df[df["datetime"].dt.strftime("%H:%M") != "09:30"]
+    return _normalize(df, "datetime")
+
+
+def _in_period(df, start, end):
+    """按 [start, end] 全日闭区间裁剪（end 当天 15:00 的 bar 也应包含）。"""
+    lo = pd.Timestamp(start).normalize()
+    hi = pd.Timestamp(end).normalize() + pd.Timedelta(days=1)
+    return df[(df["datetime"] >= lo) & (df["datetime"] < hi)]
+
+
+def _is_etf(symbol):
+    """ETF 代码段：15xxxx/16xxxx(深) 与 50xxxx/51xxxx/56xxxx/58xxxx(沪)。"""
+    code = symbol[2:] if symbol[:2] in ("sh", "sz") else symbol
+    return code.startswith(("15", "16", "50", "51", "56", "58"))
+
+
+def fetch_akshare_5min(symbol, index=False):
+    """东财分钟线：只给最近约 5 个交易日，且极易被 push2 限流——放在最后兜底。"""
+    code = symbol[2:] if symbol[:2] in ("sh", "sz") else symbol
+    if index or _is_index(symbol):
+        raw = ak.index_zh_a_hist_min_em(symbol=code, period="5")
+    elif _is_etf(symbol):
+        raw = ak.fund_etf_hist_min_em(symbol=code, period="5", adjust="qfq")
+    else:
+        raw = ak.stock_zh_a_hist_min_em(symbol=code, period="5", adjust="qfq")
+    return _normalize(raw, "时间" if "时间" in raw.columns else "datetime")
+
+
+def _kind(symbol, index=False):
+    """缓存分类前缀：指数 / 个股 / ETF。000001 既要区分上证指数和个股，靠它隔离缓存。"""
+    if index or _is_index(symbol):
+        return "idx"
+    return "stock" if not _is_etf(symbol) else "etf"
 
 
 def fetch_5min(symbol=SYMBOL, start=START_DATE, end=END_DATE, index=False):
-    """取 5 分钟线。
+    """取 5 分钟线，按以下顺序取数并用 (symbol, datetime) 合并去重。
 
-    先读本地 cache/ 下的 CSV（用户自备），没有再请求东财。
-    东财 fund_etf_hist_min_em 只返回最近约 5 个交易日，无法覆盖长区间历史。
-    本地 CSV 需包含列：时间(或datetime), open, high, low, close, volume。
+    1. 本地 cache/*_5min.csv、*.pkl（用户自备或历次累积，优先级最高）
+    2. baostock  —— 无需 token，覆盖 2024-01~2024-09 与 2026 全年（个股/ETF 有效，指数无效）
+    3. 新浪      —— 无需 token，始终给最近约 31 个交易日（个股/ETF/指数都有效）
+    4. 东财      —— 只给最近约 5 个交易日且极易限流，仅作最后兜底
+
+    多源拼合后仍缺的区间会明确告警，而不是静默用合成数据。
     """
-    tag = f"{'idx' if index else 'etf'}_{symbol}_5min"
+    tag = f"{_kind(symbol, index)}_{symbol}_5min"
     csv_path = _cache_path(tag + ".csv")
     pkl_path = _cache_path(tag + ".pkl")
+
+    sources = []
+
+    def add(name, loader):
+        try:
+            part = loader()
+        except Exception as e:
+            msg = str(e).split("\n")[0]
+            print(f"  [数据源] {name} 失败（{type(e).__name__}: {msg[:60]}）")
+            return
+        part = _in_period(part, start, end)
+        if part.empty:
+            print(f"  [数据源] {name} 该区间无数据")
+            return
+        print(f"  [数据源] {name}: {len(part)} 根 "
+              f"{part['datetime'].min()} ~ {part['datetime'].max()}")
+        sources.append(part)
+
     if os.path.exists(csv_path):
-        raw = pd.read_csv(csv_path)
-        date_col = "时间" if "时间" in raw.columns else "datetime"
-        df = _normalize(raw, date_col)
-        print(f"  5 分钟数据来自本地文件: {csv_path}（{len(df)} 行）")
-    elif os.path.exists(pkl_path):
-        df = pd.read_pickle(pkl_path)
+        raw_csv = pd.read_csv(csv_path, nrows=5)
+        add(f"本地CSV {os.path.basename(csv_path)}",
+            lambda: _normalize(pd.read_csv(csv_path),
+                               "时间" if "时间" in raw_csv.columns else "datetime"))
+    if os.path.exists(pkl_path):
+        add(f"本地缓存 {os.path.basename(pkl_path)}", lambda: pd.read_pickle(pkl_path))
+
+    add("baostock", lambda: fetch_baostock_5min(symbol, start, end, index))
+    add("新浪", lambda: fetch_sina_5min(symbol, end))
+    # 东财极易限流且只有最近几天，上面两个源已覆盖最近交易日时直接跳过
+    recent_days = {d for d in (pd.concat(sources, ignore_index=True)
+                               ["datetime"].dt.date.unique() if sources else [])}
+    newest = max(recent_days) if recent_days else None
+    if newest is not None and pd.Timestamp(end).normalize() - pd.Timestamp(newest) <= pd.Timedelta("5D"):
+        print("  [数据源] 东财已跳过（已有源覆盖到最新交易日，避免触发 push2 限流）")
     else:
-        if index:
-            raw = ak.index_zh_a_hist_min_em(symbol=symbol.replace("sh", "").replace("sz", ""),
-                                            period="5")
+        add("东财", lambda: fetch_akshare_5min(symbol, index))
+
+    if not sources:
+        raise RuntimeError("所有 5 分钟数据源均不可用")
+
+    # 合并优先级：本地缓存 > baostock > 新浪 > 东财
+    # （东财可能返回被截断/口径不同的数据，只能最后考虑）
+    df = (pd.concat(sources, ignore_index=True)
+          .drop_duplicates(subset=["datetime"], keep="first")
+          .sort_values("datetime")
+          .reset_index(drop=True))
+
+    # 合并结果回写缓存（含历次增量，下次可直接复用），CSV 同步一份便于人工查看
+    df.to_pickle(pkl_path)
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    _report_coverage(df, fetch_daily(symbol, start, end, index), symbol)
+    return df
+
+
+def _report_coverage(df5, df_daily, symbol):
+    """打印 5 分钟数据对日线交易日的覆盖情况，并指出缺口落在哪些连续区间。"""
+    covered = set(df5["datetime"].dt.date)
+    expected = sorted(set(df_daily["datetime"].dt.date))
+    missing = [d for d in expected if d not in covered]
+    span = f"{df5['datetime'].min()} ~ {df5['datetime'].max()}"
+    if not missing:
+        print(f"  [数据源] 合并后 {len(df5)} 根，{span}，覆盖全部 {len(expected)} 个交易日")
+        return
+
+    # 把缺失日合并成连续区间，方便直接看出哪些月份没数据
+    gaps, run = [], [missing[0]]
+    for prev, cur in zip(missing, missing[1:]):
+        if (pd.Timestamp(cur) - pd.Timestamp(prev)).days <= 7:
+            run.append(cur)
         else:
-            raw = ak.fund_etf_hist_min_em(symbol=symbol, period="5", adjust="qfq")
-        df = _normalize(raw, "时间" if "时间" in raw.columns else "datetime")
-        df.to_pickle(pkl_path)
-    mask = (df["datetime"] >= pd.Timestamp(start)) & (df["datetime"] <= pd.Timestamp(end))
-    return df[mask].reset_index(drop=True)
+            gaps.append((run[0], run[-1]))
+            run = [cur]
+    gaps.append((run[0], run[-1]))
+    shown = "、".join(f"{a}~{b}" for a, b in gaps[:4])
+    more = "" if len(gaps) <= 4 else f" 等 {len(gaps)} 段"
+
+    print(f"  [数据源] 合并后 {len(df5)} 根，{span}，"
+          f"覆盖 {len(expected) - len(missing)}/{len(expected)} 个交易日")
+    print(f"  [数据源] 无 5 分钟数据的交易日：{shown}{more}（共 {len(missing)} 天），回测会跳过这些天")
+    print("  [数据源] 免费源拿不到这些区间；要补齐请把本脚本加进每日定时任务，"
+          "让新浪近 31 个交易日的窗口逐日沉淀进 cache/")
+
+
+
+
+def fetch_5min_cached(symbol=SYMBOL, index=False):
+    """只读本地 5 分钟缓存，不发任何网络请求（网格搜索等重复调用用它）。"""
+    tag = f"{_kind(symbol, index)}_{symbol}_5min"
+    pkl_path = _cache_path(tag + ".pkl")
+    if not os.path.exists(pkl_path):
+        return None
+    return pd.read_pickle(pkl_path)
 
 
 def build_synthetic_5min(df_daily, path):
@@ -253,7 +474,7 @@ def prepare_5min(df5):
     df["VOL_DIVERGE"] = df["VOL_MA3_PREV"] / df["VOL_MA20_PREV"]
     dif, dea, _ = macd_hist(df["close"])
     df["DIF"], df["DEA"] = dif, dea
-    # 沪深300 的 "跌破 VWAP" 由调用方合并进来
+    # 大盘代理的 "跌破 VWAP" 由调用方合并进来
     return df
 
 
@@ -265,7 +486,7 @@ def base_ratio_signal(df_daily, df_index=None):
     d["RET"] = d["close"].pct_change()
     d["VOL_MA20"] = d["volume"].rolling(20).mean()
 
-    # 大盘暴跌判断（用指数，缺数据时退回 ETF 自身）
+    # 大盘暴跌判断（用大盘代理，缺数据时退回标的自身）
     ref = df_index[["datetime", "close", "volume"]].copy() if df_index is not None else \
         d[["datetime", "close", "volume"]].copy()
     ref["MA20"] = ref["close"].rolling(20).mean()
@@ -329,13 +550,13 @@ def run_backtest(df5, b_signal, rsi_sell=RSI_SELL_TH, vwap_atr=VWAP_ATR_MULT,
 
     df5      : 已 prepare_5min 的 5 分钟数据
     b_signal : base_ratio_signal 的输出（日线，收盘定）
-    df_mkt   : 沪深300 5 分钟（可选，用于 VWAP 过滤）
+    df_mkt   : 大盘代理 5 分钟（可选，用于 VWAP 过滤；指数或个股均可）
     """
     b_map = dict(zip(b_signal["datetime"].dt.date, b_signal["B"]))
     reason_map = dict(zip(b_signal["datetime"].dt.date, b_signal["reason"]))
 
     if df_mkt is None and MARKET_VWAP_FILTER and not quiet:
-        print("[提示] 未启用 VWAP 过滤（缺沪深300 数据），高抛条件少 1 个维度")
+        print(f"[提示] 未启用 VWAP 过滤（缺 {MARKET_INDEX} 数据），高抛条件少 1 个维度")
 
     mkt_vwap = {}
     if df_mkt is not None and MARKET_VWAP_FILTER:
@@ -350,7 +571,7 @@ def run_backtest(df5, b_signal, rsi_sell=RSI_SELL_TH, vwap_atr=VWAP_ATR_MULT,
         mkt_vwap = {(r.date, r.time): r.BELOW for r in m.itertuples()}
         has_mkt = set(zip(df5["date"], df5["time"])) & set(mkt_vwap)
         if not has_mkt:
-            print("[提示] 沪深300 时间戳与 ETF 无交集，VWAP 过滤已忽略\n")
+            print(f"[提示] {MARKET_INDEX} 时间戳与 {SYMBOL} 无交集，VWAP 过滤已忽略\n")
             mkt_vwap = {}
 
     cash = float(CAPITAL)
@@ -662,7 +883,7 @@ def diagnose_signals(df5, rsi_sell=RSI_SELL_TH, vwap_atr=VWAP_ATR_MULT):
     all_sell = conds["① RSI>阈值"] & conds["② 价>VWAP+N×ATR"] & conds["③ 量能背离<0.8"] \
         & conds["④a 5分钟MACD死叉"]
     print(f"  {'①&②&③&④a 全部满足':22s}: {int((all_sell & win).sum()):5d}")
-    print("  注: 实际触发是 ④a 或 沪深300跌破VWAP；缺指数数据时只剩 ④a，信号会偏少\n")
+    print(f"  注: 实际触发是 ④a 或 {MARKET_INDEX}跌破VWAP；缺大盘数据时只剩 ④a，信号会偏少\n")
 
     print("\n===== 买回条件逐项命中（当日全部 bar） =====")
     buy_price = (prev["close"] <= prev["VWAP"])
@@ -686,33 +907,49 @@ def main():
             raise RuntimeError("日线为空")
     except Exception as e:
         print(f"日线数据获取失败：{type(e).__name__}: {e}")
-        print("akshare 免费接口有频率限制（push2 限流），请等待几分钟后重试，")
-        print("或先运行一次把数据缓存到 cache/ 目录，再离线回测。")
+        print("新浪日线接口偶发失败，请稍后重试。")
         return
 
-    # 5 分钟数据：东财接口只给最近几个交易日，历史区间取不到时用合成数据跑通流程
+    # 5 分钟数据：多源拼合（本地缓存 / baostock / 新浪 / 东财）
     try:
         df5 = fetch_5min()
         if len(df5) < 100:
             raise RuntimeError(f"仅取到 {len(df5)} 根 5 分钟数据")
-        print("5 分钟数据来源: akshare（真实行情）")
     except Exception as e:
-        print(f"5 分钟真实数据不可用（{type(e).__name__}: {e}）")
-        print("→ 改用日线合成的 5 分钟 bar 跑通流程，**结果不可用于实盘决策**\n")
+        print(f"5 分钟真实数据全部不可用（{type(e).__name__}: {e}）")
+        if not SYNTH_FALLBACK:
+            print("→ 已中止。合成 bar 只能验证代码路径、不能作为结论；")
+            print("  如仍要用合成数据跑通流程，设置环境变量 PTRADE_SYNTH_FALLBACK=1")
+            return
+        print("→ PTRADE_SYNTH_FALLBACK=1：改用日线合成的 5 分钟 bar，"
+              "**结果不可用于实盘决策**\n")
         df5 = build_synthetic_5min(df_daily, _cache_path("synth_5min.pkl"))
 
     df5 = prepare_5min(df5)
 
     try:
-        df_idx_d = fetch_daily(MARKET_INDEX, index=True)
-        df_idx_5 = fetch_5min(MARKET_INDEX, index=True)
-        if len(df_idx_5) < 100:
-            df_idx_5 = None
+        df_idx_d = fetch_daily(MARKET_INDEX, index=MARKET_IS_INDEX)
     except Exception as e:
-        print(f"沪深300 数据获取失败（{type(e).__name__}），改用 ETF 自身作为大盘代理\n")
-        df_idx_d, df_idx_5 = None, None
+        print(f"大盘代理 {MARKET_INDEX} 日线获取失败（{type(e).__name__}），"
+              f"改用 {SYMBOL} 自身作为大盘代理\n")
+        df_idx_d = None
 
-    print(f"日线 {len(df_daily)} 行  5分钟 {len(df5)} 行\n")
+    # 大盘代理 5 分钟：指数分钟线 baostock 不支持，只能靠新浪 + 本地缓存；
+    # 个股/ETF 代理则可吃到 baostock 的长历史。缺失不影响回测主流程。
+    df_idx_5 = fetch_5min_cached(MARKET_INDEX, index=MARKET_IS_INDEX)
+    try:
+        fresh = fetch_5min(MARKET_INDEX, index=MARKET_IS_INDEX)
+        df_idx_5 = fresh if df_idx_5 is None else pd.concat([df_idx_5, fresh], ignore_index=True)
+        df_idx_5 = (df_idx_5.drop_duplicates(subset=["datetime"], keep="first")
+                    .sort_values("datetime").reset_index(drop=True))
+    except Exception as e:
+        print(f"大盘代理 {MARKET_INDEX} 5 分钟获取失败（{type(e).__name__}），"
+              f"{'沿用本地缓存' if df_idx_5 is not None else '本次不启用 VWAP 过滤'}\n")
+    if df_idx_5 is not None and len(df_idx_5) < 100:
+        df_idx_5 = None
+
+    print(f"日线 {len(df_daily)} 行  5分钟 {len(df5)} 行"
+          f"  大盘代理 {MARKET_INDEX}({MARKET_TAG}) 5分钟 {0 if df_idx_5 is None else len(df_idx_5)} 行\n")
 
     b_signal = base_ratio_signal(df_daily, df_idx_d)
     result = run_backtest(df5, b_signal, df_mkt=df_idx_5)
