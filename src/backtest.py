@@ -10,22 +10,27 @@ import os
 # ======================================================================
 
 # ---------- 标的与数据区间 ----------
-SYMBOL = "300115"
-START_DATE = "2024-09-01"
-END_DATE = "2026-10-28"        # 分钟线建议避开最近 1~2 个交易日，避免数据未入库
+SYMBOL = "159915"
+START_DATE = "2024-01-01"
+END_DATE = "2026-10-30"        # 分钟线建议避开最近 1~2 个交易日，避免数据未入库
 ADJUST_FLAG = "2"              # 1=后复权，2=前复权，3=不复权
 
 # 频率："d"=日线，"60"/"30"/"15"/"5"=分钟线
 # 注意：baostock 不支持 1 分钟线（"1"），如需 1 分钟请换数据源
-FREQUENCY = "15"
+FREQUENCY = "60"
 
 # ---------- 资金与仓位 ----------
 CAPITAL = 300000
-POSITION = 30000
+FULL_POSITION = True           # True=每次满仓买入
+POSITION = 30000               # FULL_POSITION=False 时的单笔金额
 
 # ---------- 交易成本 ----------
-COMMISSION = 0.0001
-STAMP_TAX = 0.001
+COMMISSION = 0.0001            # 佣金（买卖各收一次）
+STAMP_TAX = 0.001              # 印花税（仅卖出）
+SLIPPAGE_YUAN = 0.02           # 滑点，按每股绝对价格计：买入 +，卖出 -
+
+# ---------- 交易制度 ----------
+ENFORCE_T1 = True              # A 股 T+1：当日买入的股票当日不可卖出
 
 # ---------- 阶段开关（随时启用/屏蔽） ----------
 ENABLE_BASIC = True            # 是否跑基础回测
@@ -33,8 +38,8 @@ ENABLE_GRID = True             # 是否跑网格搜索
 ENABLE_OOS = True              # 是否跑样本外验证
 
 # ---------- 训练/测试切分 ----------
-TRAIN_END = "2025-06-01"
-MIN_TRADES = 60                # 网格搜索过滤交易过少的参数
+TRAIN_END = "2026-01-01"
+MIN_TRADES = 5                 # 网格搜索过滤交易过少的参数（B/S 条件较严，交易天然偏少）
 
 # ---------- Excel 报告 ----------
 REPORT_FILE = "backtest_report.xlsx"
@@ -46,118 +51,46 @@ BAOSTOCK_SUPPORTED_FREQ = {"d", "w", "m", "5", "15", "30", "60"}
 # 二、按频率自动适配的默认参数
 # ======================================================================
 
+# 策略只用到指标周期与年化因子；止损/止盈/趋势过滤已被 B 点/S 点规则取代
+PERIOD_CONFIGS = {
+    "d":  {"kdj_n": 11, "macd": (10, 20, 7), "annual_factor": 252},
+    "60": {"kdj_n": 11, "macd": (10, 20, 7), "annual_factor": 252 * 4},
+    "30": {"kdj_n": 11, "macd": (10, 20, 7), "annual_factor": 252 * 8},
+    "15": {"kdj_n": 11, "macd": (10, 20, 7), "annual_factor": 252 * 16},
+    "5":  {"kdj_n": 11, "macd": (10, 20, 7), "annual_factor": 252 * 48},
+}
+
 def get_period_config(freq):
-    """根据频率返回指标参数、止损止盈、网格范围、年化因子、滑点。"""
-    if freq == "d":
-        return {
-            "kdj_n": 11, "kdj_m1": 2, "kdj_m2": 2,
-            "macd_fast": 10, "macd_slow": 20, "macd_signal": 7,
-            "rsi_period": 6, "rsi_buy_th": 50,
-            "stop_loss": -0.03, "take_profit": 0.06,
-            "use_trend_filter": True, "ma_trend": 60,
-            "slippage_pct": 0.0002,
-            "annual_factor": 252,
-            "grid_stop_loss": [-0.02, -0.03, -0.05],
-            "grid_take_profit": [0.04, 0.06, 0.08],
-            "grid_kdj_n": [9, 11, 14],
-            "grid_rsi_th": [30, 40, 50],
-        }
-    elif freq == "60":
-        return {
-            "kdj_n": 9, "kdj_m1": 2, "kdj_m2": 2,
-            "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
-            "rsi_period": 6, "rsi_buy_th": 40,
-            "stop_loss": -0.02, "take_profit": 0.04,
-            "use_trend_filter": True, "ma_trend": 60,
-            "slippage_pct": 0.0004,
-            "annual_factor": 252 * 4,
-            "grid_stop_loss": [-0.01, -0.02, -0.03],
-            "grid_take_profit": [0.02, 0.03, 0.04],
-            "grid_kdj_n": [9, 14, 21],
-            "grid_rsi_th": [20, 30, 40],
-        }
-    elif freq == "30":
-        return {
-            "kdj_n": 9, "kdj_m1": 2, "kdj_m2": 2,
-            "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
-            "rsi_period": 6, "rsi_buy_th": 35,
-            "stop_loss": -0.02, "take_profit": 0.035,
-            "use_trend_filter": True, "ma_trend": 80,
-            "slippage_pct": 0.0004,
-            "annual_factor": 252 * 8,
-            "grid_stop_loss": [-0.01, -0.02, -0.03],
-            "grid_take_profit": [0.015, 0.025, 0.035],
-            "grid_kdj_n": [9, 14, 21],
-            "grid_rsi_th": [20, 30, 40],
-        }
-    elif freq == "15":
-        return {
-            "kdj_n": 9, "kdj_m1": 2, "kdj_m2": 2,
-            "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
-            "rsi_period": 6, "rsi_buy_th": 30,
-            "stop_loss": -0.02, "take_profit": 0.03,
-            "use_trend_filter": False, "ma_trend": 120,
-            "slippage_pct": 0.0005,
-            "annual_factor": 252 * 16,
-            "grid_stop_loss": [-0.01, -0.02, -0.03],
-            "grid_take_profit": [0.01, 0.02, 0.03],
-            "grid_kdj_n": [9, 14, 21],
-            "grid_rsi_th": [20, 30, 40],
-        }
-    elif freq == "5":
-        return {
-            "kdj_n": 9, "kdj_m1": 2, "kdj_m2": 2,
-            "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
-            "rsi_period": 6, "rsi_buy_th": 30,
-            "stop_loss": -0.02, "take_profit": 0.02,
-            "use_trend_filter": False, "ma_trend": 120,
-            "slippage_pct": 0.0005,
-            "annual_factor": 252 * 48,
-            "grid_stop_loss": [-0.01, -0.02, -0.03],
-            "grid_take_profit": [0.01, 0.02, 0.03],
-            "grid_kdj_n": [9, 14, 21],
-            "grid_rsi_th": [20, 30, 40],
-        }
-    elif freq == "1":
-        # baostock 不支持 1 分钟，这里仅保留配置供参考；实际取数会报错
-        return {
-            "kdj_n": 9, "kdj_m1": 2, "kdj_m2": 2,
-            "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
-            "rsi_period": 6, "rsi_buy_th": 30,
-            "stop_loss": -0.01, "take_profit": 0.01,
-            "use_trend_filter": False, "ma_trend": 240,
-            "slippage_pct": 0.0008,
-            "annual_factor": 252 * 240,
-            "grid_stop_loss": [-0.005, -0.01, -0.02],
-            "grid_take_profit": [0.005, 0.01, 0.02],
-            "grid_kdj_n": [9, 14, 21],
-            "grid_rsi_th": [20, 30, 40],
-        }
-    else:
+    """根据频率返回 KDJ 周期、MACD 参数、年化因子。"""
+    if freq not in PERIOD_CONFIGS:
         raise ValueError(f"不支持的频率: {freq}，可选 d/60/30/15/5")
+    cfg = dict(PERIOD_CONFIGS[freq])
+    cfg["macd_fast"], cfg["macd_slow"], cfg["macd_signal"] = cfg["macd"]
+    return cfg
 
 CFG = get_period_config(FREQUENCY)
 
 KDJ_N = CFG["kdj_n"]
-KDJ_M1 = CFG["kdj_m1"]
-KDJ_M2 = CFG["kdj_m2"]
+KDJ_M1 = 2
+KDJ_M2 = 2
 MACD_FAST = CFG["macd_fast"]
 MACD_SLOW = CFG["macd_slow"]
 MACD_SIGNAL = CFG["macd_signal"]
-RSI_PERIOD = CFG["rsi_period"]
-RSI_BUY_TH = CFG["rsi_buy_th"]
-STOP_LOSS = CFG["stop_loss"]
-TAKE_PROFIT = CFG["take_profit"]
-USE_TREND_FILTER = CFG["use_trend_filter"]
-MA_TREND = CFG["ma_trend"]
-SLIPPAGE_PCT = CFG["slippage_pct"]
+CCI_N = 14
+RSI_PERIODS = (7, 14, 28)          # 仅计算与展示，不参与信号
 ANNUAL_FACTOR = CFG["annual_factor"]
-GRID_STOP_LOSS = CFG["grid_stop_loss"]
-GRID_TAKE_PROFIT = CFG["grid_take_profit"]
-GRID_KDJ_N = CFG["grid_kdj_n"]
-GRID_RSI_TH = CFG["grid_rsi_th"]
 
-USE_MA10_EXIT = True
+# ---------- 信号参数（B 点 / S 点） ----------
+HIST_TH = -0.05                    # MACD 柱（2*(DIF-DEA)）下限
+CCI_TH = -75                       # 买入要求 CCI <= 该值
+VOL_MULT = 1.9                     # 放量出逃：成交量 >= 前一根的 N 倍
+DROP_PCT = 0.025                   # 急跌出逃：较前一根下跌 >= 2.5%
+
+# ---------- 网格搜索范围（只扫信号阈值） ----------
+GRID_HIST_TH = [-0.20, -0.10, -0.05, 0.0]
+GRID_CCI_TH = [-100, -85, -70, -55]
+GRID_VOL_MULT = [1.5, 1.9, 2.5]
+GRID_DROP_PCT = [0.02, 0.025, 0.03]
 
 # ======================================================================
 # 三、数据获取（统一返回 datetime 列）
@@ -244,118 +177,197 @@ def rsi(close, period=6):
     rs = gain / loss.replace(0, np.nan)
     return 100 - 100 / (1 + rs)
 
-def attach_indicators(data, kdj_n, macd_fast, macd_slow, macd_signal, ma_trend):
+def cci(high, low, close, n=14):
+    """CCI = (TP - MA(TP,n)) / (0.015 * 平均绝对偏差)。"""
+    tp = (high + low + close) / 3.0
+    ma = tp.rolling(n).mean()
+    md = (tp - ma).abs().rolling(n).mean()
+    return (tp - ma) / (0.015 * md)
+
+def attach_indicators(data, kdj_n=None, macd_fast=None, macd_slow=None, macd_signal=None):
+    """一次算出全部指标：K/D/J、MACD、CCI、RSI7/14/28、量比、均线。"""
+    kdj_n = KDJ_N if kdj_n is None else int(kdj_n)
+    macd_fast = MACD_FAST if macd_fast is None else int(macd_fast)
+    macd_slow = MACD_SLOW if macd_slow is None else int(macd_slow)
+    macd_signal = MACD_SIGNAL if macd_signal is None else int(macd_signal)
+
     data = data.copy()
-    k, d = kdj(data["high"], data["low"], data["close"], n=kdj_n)
-    dif, dea, hist = macd(data["close"], fast=macd_fast, slow=macd_slow, signal=macd_signal)
+    k, d = kdj(data["high"], data["low"], data["close"], n=kdj_n, m1=KDJ_M1, m2=KDJ_M2)
     data["K"], data["D"] = k, d
+    data["J"] = 3 * k - 2 * d
+
+    dif, dea, hist = macd(data["close"], fast=macd_fast, slow=macd_slow, signal=macd_signal)
     data["DIF"], data["DEA"], data["HIST"] = dif, dea, hist
-    data["RSI6"] = rsi(data["close"], RSI_PERIOD)
+    data["HIST_PCT"] = hist / data["close"] * 100      # 归一化柱值（%），便于跨价位比较
+
+    data["CCI"] = cci(data["high"], data["low"], data["close"], CCI_N)
+    for p in RSI_PERIODS:
+        data[f"RSI{p}"] = rsi(data["close"], p)
+
+    data["VOL_RATIO"] = data["volume"] / data["volume"].shift(1)
+    data["VOL_MA20"] = data["volume"].rolling(20).mean()
     data["MA10"] = data["close"].rolling(10).mean()
-    data["MA_TREND"] = data["close"].rolling(ma_trend).mean()
+    data["MA20"] = data["close"].rolling(20).mean()
+    data["MA60"] = data["close"].rolling(60).mean()
+    data["RET"] = data["close"].pct_change()
     return data
 
 # ======================================================================
 # 五、交易信号
 # ======================================================================
 
-def is_buy_signal(prev, row, rsi_th, use_trend_filter):
-    kdj_gold = (prev["K"] <= prev["D"]) and (row["K"] > row["D"]) and (row["K"] < 80)
-    macd_gold = (prev["DIF"] <= prev["DEA"]) and (row["DIF"] > row["DEA"])
-    rsi_ok = prev["RSI6"] < rsi_th
-    trend_ok = (prev["close"] > prev["MA_TREND"]) if use_trend_filter else True
-    return kdj_gold and macd_gold and rsi_ok and trend_ok
+def is_buy_signal(prev, row, hist_th, cci_th):
+    """B 点：MACD 柱 >= hist_th  且  J 上穿 D  且  CCI <= cci_th。
 
-def sell_reason(prev, row, entry_price, stop_loss, take_profit, use_ma10_exit):
-    pnl_pct = (prev["close"] - entry_price) / entry_price
+    说明：J = 3K - 2D，故 J - D = 3 * (K - D)，"J 上穿 D"与"K 上穿 D"是同一事件。
+    """
+    if pd.isna(row["J"]) or pd.isna(row["D"]) or pd.isna(row["CCI"]) or pd.isna(row["HIST"]):
+        return False
+    j_gold = (prev["J"] <= prev["D"]) and (row["J"] > row["D"])
+    macd_ok = row["HIST"] >= hist_th
+    cci_ok = row["CCI"] <= cci_th
+    return bool(j_gold and macd_ok and cci_ok)
 
-    if pnl_pct <= stop_loss:
-        return True, "止损"
-    if pnl_pct >= take_profit:
-        return True, "止盈"
-    if use_ma10_exit and prev["close"] < prev["MA10"]:
-        return True, "跌破MA10"
-    if prev["K"] >= prev["D"] and row["K"] < row["D"]:
-        return True, "KDJ死叉"
-    if prev["RSI6"] > 80:
-        return True, "RSI超买"
+def sell_signal(prev, row, vol_mult, drop_pct):
+    """S 点：J 下穿 D，且满足下列任一条件。
+        1) 当根成交量 >= 前一根的 vol_mult 倍
+        2) 当根收盘价较前一根下跌 >= drop_pct
+    """
+    if pd.isna(row["J"]) or pd.isna(row["D"]) or pd.isna(row["VOL_RATIO"]) or pd.isna(row["RET"]):
+        return False, None
+    if not ((prev["J"] >= prev["D"]) and (row["J"] < row["D"])):
+        return False, None
+    if row["VOL_RATIO"] >= vol_mult:
+        return True, f"放量{row['VOL_RATIO']:.2f}倍"
+    if row["RET"] <= -drop_pct:
+        return True, f"急跌{row['RET'] * 100:.2f}%"
     return False, None
 
 # ======================================================================
 # 六、回测核心
 # ======================================================================
 
-def run_backtest(data, stop_loss, take_profit, kdj_n, macd_fast, macd_slow, macd_signal,
-                 rsi_th, use_trend_filter=True, use_ma10_exit=True):
-    if data is None or len(data) < 2:
-        return {"final": CAPITAL, "profit_pct": 0.0, "ann_ret": 0.0, "max_dd": 0.0,
-                "sharpe": 0.0, "calmar": 0.0, "n_trades": 0, "win_rate": 0.0, "trades": []}
+def _empty_result():
+    return {"final": CAPITAL, "profit_pct": 0.0, "ann_ret": 0.0, "max_dd": 0.0,
+            "sharpe": 0.0, "calmar": 0.0, "n_trades": 0, "win_rate": 0.0,
+            "avg_ret_pct": 0.0, "profit_factor": 0.0, "avg_hold_bars": 0.0,
+            "trades": []}
 
-    # 防御：DataFrame 取出的数值可能是 float，rolling 要求 int
-    kdj_n = int(kdj_n)
-    macd_fast = int(macd_fast)
-    macd_slow = int(macd_slow)
-    macd_signal = int(macd_signal)
+def run_backtest(data, hist_th=None, cci_th=None, vol_mult=None,
+                 drop_pct=None, prepared=False):
+    """满仓、单标的回测。
 
-    data = attach_indicators(data, kdj_n, macd_fast, macd_slow, macd_signal, MA_TREND)
+    执行约定：
+      1. 信号在"当根收盘后"确认，在"下一根开盘"成交，避免前视偏差；
+      2. 滑点按绝对值计：买入价 = 开盘价 + SLIPPAGE_YUAN，卖出价 = 开盘价 - SLIPPAGE_YUAN；
+      3. T+1：当日买入不可当日卖出，S 点信号顺延到下一个可交易日的第一根开盘执行。
+    """
+    if data is None or len(data) < 3:
+        return _empty_result()
 
-    cash = CAPITAL
+    hist_th = HIST_TH if hist_th is None else hist_th
+    cci_th = CCI_TH if cci_th is None else cci_th
+    vol_mult = VOL_MULT if vol_mult is None else vol_mult
+    drop_pct = DROP_PCT if drop_pct is None else drop_pct
+
+    if not prepared:
+        data = attach_indicators(data)
+
+    cash = float(CAPITAL)
     shares = 0
-    entry_price = 0.0
+    entry_cost = 0.0
+    entry_date = None
+    entry_idx = 0
     trades = []
     equity_curve = []
+    pending = None                       # ("BUY"/"SELL", reason)，下一根开盘执行
 
     for i in range(1, len(data)):
         row = data.iloc[i]
-        prev = data.iloc[i-1]
-        open_p, close_p = row["open"], row["close"]
+        open_p = row["open"]
+        bar_date = row["datetime"].date()
 
-        # ---------- 卖出 ----------
-        if shares > 0:
-            should_sell, reason = sell_reason(prev, row, entry_price,
-                                              stop_loss, take_profit, use_ma10_exit)
-            if should_sell:
-                fill_price = open_p * (1 - SLIPPAGE_PCT)
-                gross = shares * fill_price
-                fee = gross * (COMMISSION + STAMP_TAX)
-                cash += gross - fee
-                trades.append({"datetime": row["datetime"], "action": "SELL", "price": fill_price,
-                               "shares": shares, "reason": reason,
-                               "pnl": (fill_price - entry_price) * shares})
-                shares = 0
-                entry_price = 0.0
-
-        # ---------- 买入 ----------
-        if shares == 0 and cash >= POSITION:
-            if is_buy_signal(prev, row, rsi_th, use_trend_filter):
-                fill_price = open_p * (1 + SLIPPAGE_PCT)
-                buy_shares = int(POSITION / fill_price / 100) * 100
-                if buy_shares > 0:
-                    cost = buy_shares * fill_price
-                    fee = cost * COMMISSION
-                    if cash >= cost + fee:
+        # ---------- 1) 执行上一根收盘挂下的单 ----------
+        if pending is not None:
+            side, reason = pending
+            if side == "SELL":
+                if shares == 0:
+                    pending = None
+                elif ENFORCE_T1 and bar_date == entry_date:
+                    pass                     # 当日买入不可卖，挂单顺延到下一根
+                else:
+                    fill_price = open_p - SLIPPAGE_YUAN
+                    gross = shares * fill_price
+                    fee = gross * (COMMISSION + STAMP_TAX)
+                    cash += gross - fee
+                    pnl = gross - fee - entry_cost
+                    trades.append({
+                        "datetime": row["datetime"], "action": "SELL",
+                        "price": fill_price, "shares": shares, "reason": reason,
+                        "pnl": pnl,
+                        "ret_pct": (pnl / entry_cost * 100) if entry_cost else 0.0,
+                        "hold_bars": i - entry_idx,
+                    })
+                    shares = 0
+                    entry_cost = 0.0
+                    entry_date = None
+                    pending = None
+            else:  # BUY
+                if shares == 0 and cash > 0:
+                    fill_price = open_p + SLIPPAGE_YUAN
+                    max_shares = int(cash / (fill_price * (1 + COMMISSION)) / 100) * 100
+                    if FULL_POSITION:
+                        buy_shares = max_shares
+                    else:
+                        budget_shares = int(POSITION / (fill_price * (1 + COMMISSION)) / 100) * 100
+                        buy_shares = min(budget_shares, max_shares)
+                    if buy_shares > 0:
+                        cost = buy_shares * fill_price
+                        fee = cost * COMMISSION
                         cash -= cost + fee
                         shares = buy_shares
-                        entry_price = fill_price
-                        trades.append({"datetime": row["datetime"], "action": "BUY", "price": fill_price,
-                                       "shares": buy_shares, "reason": "信号共振", "pnl": 0})
+                        entry_cost = cost + fee
+                        entry_date = bar_date
+                        entry_idx = i
+                        trades.append({
+                            "datetime": row["datetime"], "action": "BUY",
+                            "price": fill_price, "shares": shares, "reason": reason,
+                            "pnl": 0.0, "ret_pct": 0.0, "hold_bars": 0,
+                        })
+                pending = None
 
-        equity_curve.append(cash + shares * close_p)
+        # ---------- 2) 本根收盘后判定信号（最后一根不再挂单） ----------
+        if i < len(data) - 1:
+            prev = data.iloc[i - 1]
+            if shares > 0:
+                should_sell, why = sell_signal(prev, row, vol_mult, drop_pct)
+                if should_sell:
+                    pending = ("SELL", why)
+            elif is_buy_signal(prev, row, hist_th, cci_th):
+                pending = ("BUY", "B点")
+
+        equity_curve.append(cash + shares * row["close"])
 
     return compute_performance(equity_curve, trades)
 
 def compute_performance(equity_curve, trades):
+    if not equity_curve:
+        return _empty_result()
+
     equity = pd.Series(equity_curve)
     final_value = equity.iloc[-1]
-    daily_ret = equity.pct_change().dropna()
-    sharpe = np.sqrt(ANNUAL_FACTOR) * daily_ret.mean() / daily_ret.std() if daily_ret.std() > 0 else 0
+    bar_ret = equity.pct_change().dropna()
+    sharpe = (np.sqrt(ANNUAL_FACTOR) * bar_ret.mean() / bar_ret.std()
+              if len(bar_ret) > 1 and bar_ret.std() > 0 else 0.0)
     max_dd = ((equity.cummax() - equity) / equity.cummax()).max()
     ann_ret = (final_value / CAPITAL) ** (ANNUAL_FACTOR / len(equity)) - 1
-    calmar = ann_ret / max_dd if max_dd > 0 else np.inf
+    calmar = ann_ret / max_dd if max_dd > 1e-9 else 0.0
 
     sell_trades = [t for t in trades if t["action"] == "SELL"]
     wins = [t for t in sell_trades if t["pnl"] > 0]
-    win_rate = len(wins) / len(sell_trades) if sell_trades else 0
+    gross_win = sum(t["pnl"] for t in wins)
+    gross_loss = abs(sum(t["pnl"] for t in sell_trades if t["pnl"] <= 0))
+    win_rate = len(wins) / len(sell_trades) if sell_trades else 0.0
 
     return {
         "final": final_value,
@@ -366,6 +378,9 @@ def compute_performance(equity_curve, trades):
         "calmar": calmar,
         "n_trades": len(sell_trades),
         "win_rate": win_rate * 100,
+        "avg_ret_pct": float(np.mean([t["ret_pct"] for t in sell_trades])) if sell_trades else 0.0,
+        "profit_factor": gross_win / gross_loss if gross_loss > 0 else 0.0,
+        "avg_hold_bars": float(np.mean([t["hold_bars"] for t in sell_trades])) if sell_trades else 0.0,
         "trades": trades,
     }
 
@@ -388,25 +403,23 @@ def split_with_fallback(df, train_end):
     return train, test
 
 def grid_search(train_data, param_grid):
+    prepared = attach_indicators(train_data)   # 指标只算一次，网格只扫信号阈值
     results = []
-    for sl, tp, kn, rt in itertools.product(
-        param_grid["stop_loss"], param_grid["take_profit"],
-        param_grid["kdj_n"], param_grid["rsi_th"]
+    for hist_th, cci_th, vol_mult, drop_pct in itertools.product(
+        param_grid["hist_th"], param_grid["cci_th"],
+        param_grid["vol_mult"], param_grid["drop_pct"]
     ):
-        r = run_backtest(
-            train_data,
-            stop_loss=sl, take_profit=tp, kdj_n=kn,
-            macd_fast=MACD_FAST, macd_slow=MACD_SLOW, macd_signal=MACD_SIGNAL,
-            rsi_th=rt,
-            use_trend_filter=USE_TREND_FILTER, use_ma10_exit=USE_MA10_EXIT,
-        )
+        r = run_backtest(prepared, hist_th=hist_th, cci_th=cci_th,
+                         vol_mult=vol_mult, drop_pct=drop_pct, prepared=True)
         if r["n_trades"] >= MIN_TRADES:
             results.append({
-                "stop_loss": sl, "take_profit": tp, "kdj_n": kn, "rsi_th": rt,
+                "hist_th": hist_th, "cci_th": cci_th,
+                "vol_mult": vol_mult, "drop_pct": drop_pct,
                 "final": r["final"], "profit_pct": r["profit_pct"],
                 "ann_ret": r["ann_ret"], "max_dd": r["max_dd"],
                 "sharpe": r["sharpe"], "calmar": r["calmar"],
                 "n_trades": r["n_trades"], "win_rate": r["win_rate"],
+                "avg_ret_pct": r["avg_ret_pct"], "profit_factor": r["profit_factor"],
             })
     if not results:
         return pd.DataFrame()
@@ -415,12 +428,10 @@ def grid_search(train_data, param_grid):
 def validate_out_of_sample(test_data, best_params):
     return run_backtest(
         test_data,
-        stop_loss=best_params["stop_loss"],
-        take_profit=best_params["take_profit"],
-        kdj_n=best_params["kdj_n"],
-        macd_fast=MACD_FAST, macd_slow=MACD_SLOW, macd_signal=MACD_SIGNAL,
-        rsi_th=best_params["rsi_th"],
-        use_trend_filter=USE_TREND_FILTER, use_ma10_exit=USE_MA10_EXIT,
+        hist_th=best_params["hist_th"],
+        cci_th=best_params["cci_th"],
+        vol_mult=best_params["vol_mult"],
+        drop_pct=best_params["drop_pct"],
     )
 
 # ======================================================================
@@ -433,6 +444,8 @@ def print_perf(title, r):
     print(f"年化: {r['ann_ret']:.2%}  最大回撤: {r['max_dd']:.2f}%  "
           f"夏普: {r['sharpe']:.2f}  Calmar: {r['calmar']:.2f}")
     print(f"交易次数: {r['n_trades']}  胜率: {r['win_rate']:.1f}%")
+    print(f"每笔均收益: {r['avg_ret_pct']:.2f}%  盈亏因子: {r['profit_factor']:.2f}  "
+          f"平均持仓: {r['avg_hold_bars']:.1f} 根")
     print()
 
 def print_trades(trades):
@@ -442,7 +455,8 @@ def print_trades(trades):
         return
     for t in trades:
         print(f"{t['datetime']} {t['action']:4s} 价格={t['price']:.2f} "
-              f"股数={t['shares']} 原因={t['reason']} 盈亏={t['pnl']:.2f}")
+              f"股数={t['shares']} 原因={t['reason']} 盈亏={t['pnl']:.2f} "
+              f"收益率={t['ret_pct']:.2f}% 持仓={t['hold_bars']}根")
 
 # ======================================================================
 # 九、Excel 报告导出
@@ -459,6 +473,9 @@ def _summary_row(stage_name, r):
         "Calmar": round(r["calmar"], 3),
         "交易次数": r["n_trades"],
         "胜率%": round(r["win_rate"], 2),
+        "每笔均收益%": round(r["avg_ret_pct"], 2),
+        "盈亏因子": round(r["profit_factor"], 3),
+        "平均持仓根": round(r["avg_hold_bars"], 1),
     }
 
 def _trades_df(trades):
@@ -534,11 +551,10 @@ def export_excel(basic_result=None, grid_df=None, oos_result=None,
 def run_basic_backtest(df):
     """阶段 1：基础回测（默认参数）。"""
     print(f"===== 基础回测（默认参数，频率={FREQUENCY}） =====")
-    r = run_backtest(
-        df, STOP_LOSS, TAKE_PROFIT, KDJ_N,
-        MACD_FAST, MACD_SLOW, MACD_SIGNAL, RSI_BUY_TH,
-        USE_TREND_FILTER, USE_MA10_EXIT,
-    )
+    print(f"B点: MACD柱>={HIST_TH} 且 J上穿D 且 CCI<={CCI_TH}")
+    print(f"S点: J下穿D 且 (量比>={VOL_MULT} 或 跌幅>={DROP_PCT * 100:.1f}%)")
+    print(f"资金 {CAPITAL:,.0f} 元，全仓={FULL_POSITION}，滑点 {SLIPPAGE_YUAN} 元/股，T+1={ENFORCE_T1}\n")
+    r = run_backtest(df)
     print_perf("基础回测结果", r)
     return r
 
@@ -549,10 +565,10 @@ def run_grid_search_stage(df):
     print(f"测试集: {test['datetime'].min()} ~ {test['datetime'].max()} ({len(test)} 行)\n")
 
     param_grid = {
-        "stop_loss": GRID_STOP_LOSS,
-        "take_profit": GRID_TAKE_PROFIT,
-        "kdj_n": GRID_KDJ_N,
-        "rsi_th": GRID_RSI_TH,
+        "hist_th": GRID_HIST_TH,
+        "cci_th": GRID_CCI_TH,
+        "vol_mult": GRID_VOL_MULT,
+        "drop_pct": GRID_DROP_PCT,
     }
     print("===== 网格搜索（训练集） =====")
     res_df = grid_search(train, param_grid)
@@ -565,7 +581,6 @@ def run_grid_search_stage(df):
     print()
 
     best = res_df.iloc[0].to_dict()
-    best["kdj_n"] = int(best["kdj_n"])   # 关键：转 int，避免 rolling 报错
     return train, test, res_df, best
 
 def run_oos_stage(test, best):
@@ -575,8 +590,8 @@ def run_oos_stage(test, best):
         return None
 
     print("===== 样本外验证（测试集） =====")
-    print(f"最优参数: stop_loss={best['stop_loss']}, take_profit={best['take_profit']}, "
-          f"kdj_n={best['kdj_n']}, rsi_th={best['rsi_th']}\n")
+    print(f"最优参数: hist_th={best['hist_th']}, cci_th={best['cci_th']}, "
+          f"vol_mult={best['vol_mult']}, drop_pct={best['drop_pct']}\n")
     oos = validate_out_of_sample(test, best)
     print_perf("样本外结果", oos)
     print_trades(oos["trades"])
@@ -610,8 +625,8 @@ def main():
         if best is None and res_df is None:
             train, test = split_with_fallback(df, TRAIN_END)
             best = {
-                "stop_loss": STOP_LOSS, "take_profit": TAKE_PROFIT,
-                "kdj_n": KDJ_N, "rsi_th": RSI_BUY_TH,
+                "hist_th": HIST_TH, "cci_th": CCI_TH,
+                "vol_mult": VOL_MULT, "drop_pct": DROP_PCT,
             }
         if test is not None:
             oos_result = run_oos_stage(test, best)
@@ -624,20 +639,22 @@ def main():
         "频率": FREQUENCY,
         "复权方式": ADJUST_FLAG,
         "初始资金": CAPITAL,
-        "单笔仓位": POSITION,
+        "仓位模式": "全仓" if FULL_POSITION else f"定额 {POSITION}",
         "佣金率": COMMISSION,
         "印花税": STAMP_TAX,
-        "滑点": SLIPPAGE_PCT,
         "训练截止": TRAIN_END,
         "最小交易次数": MIN_TRADES,
-        "默认止损": STOP_LOSS,
-        "默认止盈": TAKE_PROFIT,
-        "KDJ_N": KDJ_N,
+        "KDJ": f"{KDJ_N},{KDJ_M1},{KDJ_M2}",
         "MACD": f"{MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL}",
-        "RSI周期": RSI_PERIOD,
-        "RSI买入阈值": RSI_BUY_TH,
-        "趋势过滤": USE_TREND_FILTER,
-        "MA趋势": MA_TREND,
+        "CCI周期": CCI_N,
+        "RSI周期": "/".join(str(p) for p in RSI_PERIODS),
+        "MACD柱阈值": HIST_TH,
+        "CCI阈值": CCI_TH,
+        "放量倍数": VOL_MULT,
+        "急跌幅度": DROP_PCT,
+        "全仓": FULL_POSITION,
+        "滑点(元/股)": SLIPPAGE_YUAN,
+        "T+1": ENFORCE_T1,
     }
     export_excel(
         basic_result=basic_result,
