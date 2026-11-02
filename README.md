@@ -17,3 +17,7 @@ docker run --rm -v "$(pwd):/app" ptrade-py312 python src/backtest_etf_t.py --sta
 
 # 进容器手动操作（如果 CMD 是 bash，或不带命令直接 bash）
 docker run --rm -it -v "$(pwd):/app" ptrade-py312 bash
+
+# 使用脚本运行
+./run.sh src/backtest.py
+./run.sh src/backtest_etf_t.py
