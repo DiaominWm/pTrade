@@ -3,7 +3,16 @@ import baostock as bs
 import pandas as pd
 import numpy as np
 import itertools
+import socket
+import time
 import os
+
+# baostock 内部 socket 未设超时，网络抖动时会永久挂死；这里统一设置默认超时
+SOCKET_TIMEOUT = 30            # 秒
+
+# 公共接口偶发 "10002007 网络接收错误 / Broken pipe / Connection refused"，需要重试
+FETCH_RETRIES = 5              # 最多尝试次数
+FETCH_RETRY_WAIT = 3           # 第 n 次失败后等待 n*FETCH_RETRY_WAIT 秒再试
 
 # ======================================================================
 # 一、回测参数（全部集中在这里，按需修改）
@@ -96,8 +105,37 @@ GRID_DROP_PCT = [0.02, 0.025, 0.03]
 # 三、数据获取（统一返回 datetime 列）
 # ======================================================================
 
+def _query_once(bs_code, fields, start_date, end_date, frequency, adjustflag):
+    """登录 + 查询一次，返回 (rows, fields, error_code, error_msg)。
+
+    无论成功失败都会 logout，避免残留半开连接污染下一次重试。
+    """
+    lg = bs.login()
+    if lg.error_code != "0":
+        raise RuntimeError(f"登录失败({lg.error_code}): {lg.error_msg}")
+
+    try:
+        rs = bs.query_history_k_data_plus(
+            bs_code, fields,
+            start_date=start_date, end_date=end_date,
+            frequency=frequency, adjustflag=adjustflag,
+        )
+        rows = []
+        while (rs.error_code == "0") & rs.next():
+            rows.append(rs.get_row_data())
+        return rows, rs.fields, rs.error_code, rs.error_msg
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+
 def fetch_data(symbol, start_date, end_date, adjustflag, frequency="d"):
-    """获取日线或分钟线，统一返回 datetime/open/high/low/close/volume。"""
+    """获取日线或分钟线，统一返回 datetime/open/high/low/close/volume。
+
+    对 baostock 公共接口的偶发网络错误（10002007 / Broken pipe / 拒连）自动重试。
+    """
     if frequency not in BAOSTOCK_SUPPORTED_FREQ:
         raise ValueError(
             f"baostock 不支持频率 '{frequency}'，"
@@ -105,35 +143,51 @@ def fetch_data(symbol, start_date, end_date, adjustflag, frequency="d"):
             f"如需 1 分钟线，请换用其他数据源（如 akshare/tushare）。"
         )
 
+    socket.setdefaulttimeout(SOCKET_TIMEOUT)
+
     bs_code = ("sh." if symbol.startswith("6") else "sz.") + symbol
     is_minute = frequency != "d"
-
-    bs.login()
     fields = "date,time,open,high,low,close,volume" if is_minute else \
              "date,open,high,low,close,volume"
-    rs = bs.query_history_k_data_plus(
-        bs_code, fields,
-        start_date=start_date, end_date=end_date,
-        frequency=frequency, adjustflag=adjustflag,
-    )
-    data_list = []
-    while (rs.error_code == "0") & rs.next():
-        data_list.append(rs.get_row_data())
 
-    # 诊断信息：能区分是接口报错还是数据确实为空
-    print(f"[fetch_data] code={bs_code} freq={frequency} "
-          f"区间={start_date}~{end_date} "
-          f"状态码={rs.error_code} 消息={rs.error_msg} 返回行数={len(data_list)}")
+    data_list, df_fields = None, None
+    last_err = None
+    for attempt in range(1, FETCH_RETRIES + 1):
+        try:
+            data_list, df_fields, err_code, err_msg = _query_once(
+                bs_code, fields, start_date, end_date, frequency, adjustflag)
+            print(f"[fetch_data] 第{attempt}次 code={bs_code} freq={frequency} "
+                  f"区间={start_date}~{end_date} "
+                  f"状态码={err_code} 消息={err_msg} 返回行数={len(data_list)}")
+            if err_code == "0":
+                last_err = None
+                break
+            raise RuntimeError(f"接口报错({err_code}): {err_msg}")
+        except Exception as e:
+            last_err = e
+            print(f"[fetch_data] 第{attempt}/{FETCH_RETRIES}次失败: {e}")
+            if attempt < FETCH_RETRIES:
+                wait = FETCH_RETRY_WAIT * attempt
+                print(f"[fetch_data] {wait}s 后重试…")
+                time.sleep(wait)
 
-    df = pd.DataFrame(data_list, columns=rs.fields)
-    bs.logout()
+    if last_err is not None:
+        raise RuntimeError(
+            f"连续 {FETCH_RETRIES} 次访问 baostock 失败，最后一次错误：{last_err}\n"
+            "请检查网络（能否连通 public-api.baostock.com:10030），稍后重试。"
+        ) from last_err
+
+    df = pd.DataFrame(data_list, columns=df_fields)
 
     if df.empty:
         hint = (
-            "未获取到数据。可能原因：\n"
-            "  1) 分钟线当日数据需等收盘后 20:30 左右入库，END_DATE 请往前挪 1~2 个交易日；\n"
-            "  2) 频率不受支持（baostock 只支持 d/w/m/5/15/30/60，无 1 分钟）；\n"
-            "  3) 股票代码、日期区间或复权参数有误。"
+            "未获取到数据（接口正常返回但结果为空）。可能原因：\n"
+            "  1) 该标的该频率没有数据：baostock 的 ETF/基金分钟线覆盖不全，"
+            "常出现整年缺失（例如 159915 的 60 分钟线没有 2025 年数据），"
+            "可改用 FREQUENCY=\"d\" 日线；\n"
+            "  2) 分钟线当日数据需等收盘后 20:30 左右入库，END_DATE 请往前挪 1~2 个交易日；\n"
+            "  3) 频率不受支持（baostock 只支持 d/w/m/5/15/30/60，无 1 分钟）；\n"
+            "  4) 股票代码、日期区间或复权参数有误。"
         )
         raise RuntimeError(hint)
 
@@ -147,6 +201,17 @@ def fetch_data(symbol, start_date, end_date, adjustflag, frequency="d"):
 
     df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
     df = df[["datetime", "open", "high", "low", "close", "volume"]]
+
+    # 数据覆盖检查：分钟线常有大段缺口，会直接导致样本内/样本外切分失真
+    years = df["datetime"].dt.year.value_counts().sort_index()
+    print(f"[fetch_data] 实际覆盖: {df['datetime'].min()} ~ {df['datetime'].max()}，"
+          f"按年行数={years.to_dict()}")
+    expected = set(range(pd.to_datetime(start_date).year,
+                         pd.to_datetime(end_date).year + 1))
+    missing = sorted(expected - set(int(y) for y in years.index))
+    if missing:
+        print(f"[fetch_data] ⚠️ 缺少这些年份的数据: {missing}，回测与切分结果可能失真")
+
     return df
 
 # ======================================================================
