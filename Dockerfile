@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir akshare
 
 COPY . .
 
-CMD ["python", "src/backtest_etf_t.py"]
+CMD ["bash"]
